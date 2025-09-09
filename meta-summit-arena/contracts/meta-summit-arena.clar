@@ -14,6 +14,8 @@
 (define-constant ERR-ORACLE-ERROR (err u110))
 (define-constant ERR-INSUFFICIENT-FUNDS (err u111))
 (define-constant ERR-TOURNAMENT-ALREADY-EXECUTED (err u112))
+(define-constant ERR-ROUND-ALREADY-EXISTS (err u113))
+(define-constant ERR-INVALID-ROUND (err u114))
 
 ;; Contract Constants
 (define-constant CONTRACT-OWNER tx-sender)
@@ -30,6 +32,7 @@
 (define-data-var oracle-address (optional principal) none)
 (define-data-var arena-paused bool false)
 (define-data-var min-quorum uint u1000)
+(define-data-var oracle-request-counter uint u0)
 
 ;; Tournament Structure
 (define-map tournaments uint {
@@ -144,6 +147,31 @@
     )
 )
 
+;; Calculate quadratic weight for voting
+(define-private (calculate-quadratic-weight (base-weight uint))
+    (let (
+        (sqrt-weight (sqrti base-weight))
+    )
+        (* sqrt-weight QUADRATIC-SCALING)
+    )
+)
+
+;; Evaluate tournament outcome based on votes
+(define-private (evaluate-tournament-outcome (tournament-id uint))
+    (let (
+        (tournament (unwrap! (map-get? tournaments tournament-id) false))
+        (total-yes (get skill-rating-weighted-yes tournament))
+        (total-no (get skill-rating-weighted-no tournament))
+        (total-votes (+ total-yes total-no))
+        (min-quorum-threshold (var-get min-quorum))
+    )
+        (and 
+            (>= total-votes min-quorum-threshold)
+            (> total-yes total-no)
+        )
+    )
+)
+
 ;; Utility Functions - Fixed to return proper response type
 (define-private (update-player-activity (player principal))
     (let (
@@ -189,6 +217,14 @@
     (begin
         (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
         (var-set arena-paused true)
+        (ok true)
+    )
+)
+
+(define-public (resume-arena)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (var-set arena-paused false)
         (ok true)
     )
 )
@@ -269,7 +305,20 @@
                         )
                     )
                 )
-                ERR-INVALID-PHASE
+                (if (is-eq current-phase "execution")
+                    (begin
+                        ;; Check if all rounds completed
+                        (if (>= (get rounds-completed tournament) (get total-rounds tournament))
+                            (begin
+                                (map-set tournaments tournament-id (merge tournament {phase: "completed"}))
+                                (unwrap! (finalize-tournament-rewards tournament-id) ERR-INSUFFICIENT-FUNDS)
+                                (ok "tournament-completed")
+                            )
+                            ERR-INVALID-PHASE
+                        )
+                    )
+                    ERR-INVALID-PHASE
+                )
             )
         )
     )
@@ -315,6 +364,37 @@
 )
 
 ;; Round and Prize Pool Management
+(define-public (create-round 
+    (tournament-id uint) 
+    (round-id uint)
+    (description (string-utf8 200))
+    (target-date uint)
+    (required-amount uint)
+    (verification-method (string-ascii 30)))
+    (let (
+        (tournament (unwrap! (map-get? tournaments tournament-id) ERR-TOURNAMENT-NOT-FOUND))
+        (round-key {tournament-id: tournament-id, round-id: round-id})
+    )
+        (asserts! (is-eq tx-sender (get organizer tournament)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get phase tournament) "execution") ERR-INVALID-PHASE)
+        (asserts! (is-none (map-get? tournament-rounds round-key)) ERR-ROUND-ALREADY-EXISTS)
+        (asserts! (> target-date block-height) ERR-INVALID-ROUND)
+        (asserts! (> required-amount u0) ERR-INVALID-AMOUNT)
+        
+        (map-set tournament-rounds round-key {
+            description: description,
+            target-date: target-date,
+            completion-date: none,
+            required-amount: required-amount,
+            verification-method: verification-method,
+            completed: false,
+            oracle-verified: false
+        })
+        
+        (ok true)
+    )
+)
+
 (define-public (complete-round (tournament-id uint) (round-id uint) (verification-data (buff 32)))
     (let (
         (tournament (unwrap! (map-get? tournaments tournament-id) ERR-TOURNAMENT-NOT-FOUND))
@@ -346,15 +426,195 @@
     )
 )
 
-(define-public (create-round 
-    (tournament-id uint) 
-    (round-id uint)
-    (description (string-utf8 200))
-    (target-date uint)
-    (required-amount uint)
-    (verification-method (string-ascii 30)))
+;; Oracle verification system
+(define-private (request-oracle-verification (tournament-id uint) (round-id uint) (data-hash (buff 32)))
     (let (
+        (new-request-id (+ (var-get oracle-request-counter) u1))
+    )
+        (map-set oracle-requests new-request-id {
+            request-type: "round-verification",
+            tournament-id: tournament-id,
+            data-hash: data-hash,
+            timestamp: block-height,
+            verified: false,
+            result: none
+        })
+        
+        (var-set oracle-request-counter new-request-id)
+        (ok new-request-id)
+    )
+)
+
+;; Prize allocation and distribution
+(define-private (allocate-prizes (tournament-id uint) (amount uint))
+    (begin
+        (asserts! (<= amount (var-get prize-pool-balance)) ERR-INSUFFICIENT-FUNDS)
+        
+        (map-set prize-allocations tournament-id {
+            tournament-id: tournament-id,
+            allocated-amount: amount,
+            distributed-amount: u0,
+            locked-until: (+ block-height u144), ;; Lock for 1 day
+            reallocation-target: none
+        })
+        
+        (var-set prize-pool-balance (- (var-get prize-pool-balance) amount))
+        (ok true)
+    )
+)
+
+(define-private (release-round-prizes (tournament-id uint) (round-id uint))
+    (let (
+        (allocation (unwrap! (map-get? prize-allocations tournament-id) ERR-INSUFFICIENT-FUNDS))
         (tournament (unwrap! (map-get? tournaments tournament-id) ERR-TOURNAMENT-NOT-FOUND))
         (round-key {tournament-id: tournament-id, round-id: round-id})
+        (round (unwrap! (map-get? tournament-rounds round-key) ERR-ROUND-NOT-READY))
+        (prize-per-round (/ (get allocated-amount allocation) (get total-rounds tournament)))
     )
-        (asserts! (is-eq tx-sender (get organizer tournament)) ERR
+        (asserts! (get oracle-verified round) ERR-ORACLE-ERROR)
+        
+        (map-set prize-allocations tournament-id (merge allocation {
+            distributed-amount: (+ (get distributed-amount allocation) prize-per-round)
+        }))
+        
+        (ok prize-per-round)
+    )
+)
+
+(define-private (finalize-tournament-rewards (tournament-id uint))
+    (let (
+        (tournament (unwrap! (map-get? tournaments tournament-id) ERR-TOURNAMENT-NOT-FOUND))
+        (organizer (get organizer tournament))
+        (current-rating (default-to {
+            base-skill-rating: u0,
+            decay-adjusted: u0,
+            last-activity: u0,
+            successful-tournaments: u0,
+            failed-tournaments: u0,
+            voting-accuracy: u100,
+            locked-skill-rating: u0,
+            skill-rating-source: "tournament"
+        } (map-get? player-skill-rating organizer)))
+    )
+        ;; Update organizer's skill rating based on tournament success
+        (map-set player-skill-rating organizer (merge current-rating {
+            successful-tournaments: (+ (get successful-tournaments current-rating) u1),
+            base-skill-rating: (+ (get base-skill-rating current-rating) u10),
+            last-activity: block-height
+        }))
+        
+        (ok true)
+    )
+)
+
+;; Oracle callback for verification
+(define-public (oracle-verify-round (request-id uint) (tournament-id uint) (round-id uint) (verified bool))
+    (let (
+        (oracle-addr (unwrap! (var-get oracle-address) ERR-ORACLE-ERROR))
+        (request (unwrap! (map-get? oracle-requests request-id) ERR-ORACLE-ERROR))
+        (round-key {tournament-id: tournament-id, round-id: round-id})
+        (round (unwrap! (map-get? tournament-rounds round-key) ERR-ROUND-NOT-READY))
+    )
+        (asserts! (is-eq tx-sender oracle-addr) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get tournament-id request) tournament-id) ERR-ORACLE-ERROR)
+        
+        (map-set oracle-requests request-id (merge request {
+            verified: true,
+            result: (some (if verified u1 u0))
+        }))
+        
+        (map-set tournament-rounds round-key (merge round {
+            oracle-verified: verified
+        }))
+        
+        (ok verified)
+    )
+)
+
+;; Skill rating management
+(define-public (update-skill-rating (player principal) (new-base-rating uint) (source (string-ascii 50)))
+    (let (
+        (oracle-addr (unwrap! (var-get oracle-address) ERR-ORACLE-ERROR))
+        (current-rating (default-to {
+            base-skill-rating: u0,
+            decay-adjusted: u0,
+            last-activity: u0,
+            successful-tournaments: u0,
+            failed-tournaments: u0,
+            voting-accuracy: u100,
+            locked-skill-rating: u0,
+            skill-rating-source: "manual"
+        } (map-get? player-skill-rating player)))
+    )
+        (asserts! (or (is-eq tx-sender CONTRACT-OWNER) (is-eq tx-sender oracle-addr)) ERR-NOT-AUTHORIZED)
+        (asserts! (> new-base-rating u0) ERR-INVALID-AMOUNT)
+        
+        (map-set player-skill-rating player (merge current-rating {
+            base-skill-rating: new-base-rating,
+            skill-rating-source: source,
+            last-activity: block-height
+        }))
+        
+        (ok true)
+    )
+)
+
+(define-public (submit-skill-rating-appeal (reason (string-utf8 300)) (requested-adjustment int))
+    (begin
+        (asserts! (not (var-get arena-paused)) ERR-NOT-AUTHORIZED)
+        (asserts! (> (len reason) u0) ERR-INVALID-AMOUNT)
+        
+        (map-set skill-rating-appeals tx-sender {
+            appeal-reason: reason,
+            requested-adjustment: requested-adjustment,
+            submitted-at: block-height,
+            status: "pending",
+            reviewed-by: none
+        })
+        
+        (ok true)
+    )
+)
+
+;; Read-only functions
+(define-read-only (get-tournament (tournament-id uint))
+    (map-get? tournaments tournament-id)
+)
+
+(define-read-only (get-player-skill-rating (player principal))
+    (let (
+        (current-rating (calculate-current-skill-rating player))
+        (stored-data (map-get? player-skill-rating player))
+    )
+        {
+            current-skill-rating: current-rating,
+            stored-data: stored-data
+        }
+    )
+)
+
+(define-read-only (get-tournament-votes (tournament-id uint))
+    (let (
+        (tournament (map-get? tournaments tournament-id))
+    )
+        tournament
+    )
+)
+
+(define-read-only (get-round (tournament-id uint) (round-id uint))
+    (map-get? tournament-rounds {tournament-id: tournament-id, round-id: round-id})
+)
+
+(define-read-only (get-prize-allocation (tournament-id uint))
+    (map-get? prize-allocations tournament-id)
+)
+
+(define-read-only (get-arena-status)
+    {
+        paused: (var-get arena-paused),
+        prize-pool-balance: (var-get prize-pool-balance),
+        tournament-counter: (var-get tournament-counter),
+        min-quorum: (var-get min-quorum),
+        oracle-address: (var-get oracle-address)
+    }
+)
